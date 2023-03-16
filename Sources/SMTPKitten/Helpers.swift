@@ -20,3 +20,12 @@ extension Date {
         return smtpDateFormatter.string(from: self)
     }
 }
+
+extension String {
+	
+	func removingAll(where shouldBeRemoved: (Character) throws -> Bool) rethrows -> String {
+		var string = self
+		try string.removeAll(where: shouldBeRemoved)
+		return string
+	}
+}

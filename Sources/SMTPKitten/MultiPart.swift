@@ -9,6 +9,18 @@
 import Foundation
 import NIO
 
+
+enum Boundary {
+	
+	static func build(_ prefix: String = "Part") -> String {
+		let multiplier: Double = 1000.0
+		let timestamp = Int((Date().timeIntervalSince1970 * multiplier))
+		let stamp = UUID().uuidString.removingAll { $0.isLetter || $0.isPunctuation }
+		
+		return "--------=_\(prefix)_\(stamp).\(timestamp)"
+	}
+}
+
 protocol MultiPartProtocol {
 	var lines: [String] { get set }
 }
@@ -47,7 +59,7 @@ final class MultiPartFilePart: MultiPartProtocol {
 
 final class MultiPartAlternativePart: MultiPartProtocol {
 	
-	private let alternativeBoundary: String = UUID().uuidString
+	private let alternativeBoundary = Boundary.build("Alternative")
 	private lazy var alternativeHeader = "Content-Type: multipart/alternative; boundary=\(alternativeBoundary)"
 	
 	var lines: [String] = []
@@ -81,7 +93,7 @@ final class MultiPartAlternativePart: MultiPartProtocol {
 
 final class MultiPartBody {
 	
-	private let multipartBoundary = UUID().uuidString
+	private let multipartBoundary = Boundary.build()
 	private(set) var lines: [String] = []
 	
 	public lazy var contentTypeHeader = "multipart/mixed; boundary=\(multipartBoundary)"
