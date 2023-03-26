@@ -21,15 +21,9 @@ public enum SMTPSSLConfiguration {
     }
 }
 
-/// The mode that the SMTP client should use for SSL. This can be either `startTLS`, `tls` or `insecure`.
 public enum SMTPSSLMode {
-    /// The SMTP client should use the `STARTTLS` command to upgrade the connection to SSL.
     case startTLS(configuration: SMTPSSLConfiguration)
-
-    /// The SMTP client should use SSL from the start.
     case tls(configuration: SMTPSSLConfiguration)
-
-    /// The SMTP client should not use SSL.
     case insecure
 }
 
@@ -48,7 +42,6 @@ internal final class ErrorCloseHandler: ChannelInboundHandler {
         context.close(promise: nil)
     }
 }
-
 
 internal final class SMTPClientContext {
     private var queue = [OutstandingRequest]()
@@ -91,11 +84,10 @@ internal final class SMTPClientContext {
             return
         }
         
-        // Start 'em back up again
+        isProcessing = true
         item.sendMessage().flatMap {
             item.promise.futureResult
         }.hop(to: eventLoop).whenComplete { _ in
-            // Ensure this item it out of the pool
             self.queue.removeFirst()
             self.isProcessing = false
             
@@ -130,12 +122,12 @@ internal struct SMTPHandshake {
     }
 }
 
-/// The SMTP client. This is the main entry point for the SMTPKitten library. It is used to connect to an SMTP server and send emails.
 public final class SMTPClient {
     private let channel: Channel
     public let eventLoop: EventLoop
     private let context: SMTPClientContext
     public let hostname: String
+    public let ssl: SMTPSSLMode
     
     internal private(set) var handshake: SMTPHandshake?
     
@@ -143,232 +135,90 @@ public final class SMTPClient {
         channel: Channel,
         eventLoop: EventLoop,
         context: SMTPClientContext,
-        hostname: String
+        hostname: String,
+        ssl: SMTPSSLMode
     ) {
         self.channel = channel
         self.eventLoop = eventLoop
         self.context = context
         self.hostname = hostname
+        self.ssl = ssl
     }
     
-    /// Connect to an SMTP server.
     public static func connect(
         hostname: String,
-        port: Int = 587,
-        ssl: SMTPSSLMode,
-        on eventLoop: EventLoop = MultiThreadedEventLoopGroup(numberOfThreads: 1).next()
-    ) async throws -> SMTPClient {
-        return try await connect(hostname: hostname, port: port, ssl: ssl, eventLoop: eventLoop)
-    }
-    
-    /// Connect to an SMTP server.
-    public static func connect(
-        hostname: String,
-        channel: Channel,
-        ssl: SMTPSSLMode,
-        on eventLoop: EventLoop = MultiThreadedEventLoopGroup(numberOfThreads: 1).next()
-    ) async throws -> SMTPClient {
-        let context = SMTPClientContext(eventLoop: channel.eventLoop)
-        
-        let lineBasedFrameDecoder = ByteToMessageHandler(LineBasedFrameDecoder())
-        let parser = SMTPClientInboundHandler(context: context)
-        let serializer = MessageToByteHandler(SMTPClientOutboundHandler())
-        var handlers: [ChannelHandler] = [lineBasedFrameDecoder, parser, serializer, ErrorCloseHandler()]
-        
-        switch ssl {
-        case .insecure, .startTLS:
-            break
-        case let .tls(configuration):
-            let sslContext = try NIOSSLContext(configuration: configuration.makeTlsConfiguration())
-            let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: hostname)
-            
-            handlers.insert(sslHandler, at: 0)
-        }
-        
-        try await channel.pipeline.addHandlers(handlers)
-        let client = SMTPClient(
-            channel: channel,
-            eventLoop: channel.eventLoop,
-            context: context,
-            hostname: hostname
-        )
-        
-        do {
-            _ = try await client.send(.none)
-        }
-        
-        do {
-            var handshake = try await client.doHandshake()
-            client.handshake = handshake
-            
-            if case .startTLS(let configuration) = ssl {
-                if !handshake.starttls {
-                    throw SMTPError.starttlsUnsupportedByServer
-                }
-                
-                try await client.starttls(configuration: configuration)
-                handshake = try await client.doHandshake()
-                client.handshake = handshake
-            }
-        }
-        
-        return client
-    }
-        
-    /// Connect to an SMTP server.
-    public static func connect(
-        hostname: String,
-        port: Int = 587,
-        ssl: SMTPSSLMode,
-        eventLoop: EventLoop
-    ) async throws -> SMTPClient {
+        port: Int,
+        ssl: SMTPSSLMode = .startTLS(configuration: .default),
+        on eventLoopGroup: EventLoopGroup
+    ) -> EventLoopFuture<SMTPClient> {
+        let eventLoop = eventLoopGroup.next()
         let context = SMTPClientContext(eventLoop: eventLoop)
         
-        let channel = try await ClientBootstrap(group: eventLoop).channelInitializer { channel in
-            let lineBasedFrameDecoder = ByteToMessageHandler(LineBasedFrameDecoder())
-            let parser = SMTPClientInboundHandler(context: context)
-            let serializer = MessageToByteHandler(SMTPClientOutboundHandler())
-            var handlers: [ChannelHandler] = [lineBasedFrameDecoder, parser, serializer, ErrorCloseHandler()]
-            
-            switch ssl {
-            case .insecure, .startTLS:
-                break
-            case let .tls(configuration):
-                do {
-                    let sslContext = try NIOSSLContext(configuration: configuration.makeTlsConfiguration())
-                    let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: hostname)
-                    
-                    handlers.insert(sslHandler, at: 0)
-                } catch {
-                    return eventLoop.makeFailedFuture(error)
+        let bootstrap = ClientBootstrap(group: eventLoop)
+            .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+            .channelInitializer { channel in
+                let sslHandler = try? ssl.makeHandler(hostname: hostname, on: channel.eventLoop)
+                return channel.pipeline.addHandlers([
+                    ByteToMessageHandler(SMTPResponseDecoder()),
+                    MessageToByteHandler(SMTPRequestEncoder()),
+                    ErrorCloseHandler(),
+                ]).flatMap {
+                    if let sslHandler = sslHandler {
+                        return channel.pipeline.addHandler(sslHandler, position: .first)
+                    } else {
+                        return channel.eventLoop.makeSucceededFuture(())
+                    }
+                }.flatMap {
+                    channel.pipeline.addHandler(SMTPChannelHandler(context: context))
                 }
             }
+        
+        return bootstrap.connect(host: hostname, port: port).flatMap { channel in
+            let client = SMTPClient(
+                channel: channel,
+                eventLoop: eventLoop,
+                context: context,
+                hostname: hostname,
+                ssl: ssl
+            )
             
-            return channel.pipeline.addHandlers(handlers)
-        }.connect(host: hostname, port: port).get()
-        
-        let client = SMTPClient(
-            channel: channel,
-            eventLoop: eventLoop,
-            context: context,
-            hostname: hostname
-        )
-        
-        do {
-            _ = try await client.send(.none)
+            return client.sendHandshake()
         }
-        
-        do {
-            var handshake = try await client.doHandshake()
-            client.handshake = handshake
-            
-            if case .startTLS(let configuration) = ssl {
-                if !handshake.starttls {
-                    throw SMTPError.starttlsUnsupportedByServer
+    }
+    
+    public func sendHandshake() -> EventLoopFuture<SMTPClient> {
+        return self.send(EHLOCommand(domainName: self.hostname)).flatMap { message in
+            if let handshake = SMTPHandshake(message) {
+                self.handshake = handshake
+                
+                if self.ssl == .startTLS(configuration: .default), handshake.starttls {
+                    return self.send(STARTTLSCommand()).flatMap {
+                        self.channel.pipeline.removeHandler(try! self.ssl.makeHandler(hostname: self.hostname, on: self.eventLoop))
+                    }.flatMap {
+                        self.send(EHLOCommand(domainName: self.hostname))
+                    }.map { _ in
+                        self
+                    }
+                } else {
+                    return self.eventLoop.makeSucceededFuture(self)
                 }
-                
-                try await client.starttls(configuration: configuration)
-                handshake = try await client.doHandshake()
-                client.handshake = handshake
+            } else {
+                return self.eventLoop.makeFailedFuture(SMTPError.invalidHandshake)
             }
         }
-                
-        return client
     }
     
-    /// Send a message and wait for a responses.
-    public func send(
-        _ message: SMTPClientMessage
-    ) async throws -> SMTPServerMessage {
-        let response = try await self.context.sendMessage {
-            return self.channel.writeAndFlush(message)
-        }.get()
-        
-        return response
+    public func send(_ command: SMTPClientCommand) -> EventLoopFuture<SMTPServerMessage> {
+        return self.context.sendMessage {
+            self.channel.writeAndFlush(command)
+        }
     }
     
-    /// Send a message without waiting for a response. This is useful for sending the `QUIT` command.
-    public func sendWithoutResponse(
-        _ message: SMTPClientMessage
-    ) -> EventLoopFuture<Void> {
-        return self.channel.writeAndFlush(message)
+    public func close() -> EventLoopFuture<Void> {
+        return self.channel.close()
     }
     
-    internal func doHandshake() async throws -> SMTPHandshake {
-        let message = try await send(.ehlo(hostname: hostname))
-        guard let handshake = SMTPHandshake(message) else {
-            throw SMTPError.missingHandshake
-        }
-        
-        return handshake
-    }
-    
-    internal func starttls(configuration: SMTPSSLConfiguration) async throws {
-        try await send(.starttls)
-            .status(.serviceReady, or: SMTPError.startTlsFailure)
-        
-        let sslContext = try NIOSSLContext(configuration: configuration.makeTlsConfiguration())
-        let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: self.hostname)
-        
-        try await self.channel.pipeline.addHandler(sslHandler, position: .first).get()
-    }
-    
-    public func login(user: String, password: String) async throws {
-        try await send(.authenticateLogin)
-            .status(.containingChallenge, or: SMTPError.loginFailure)
-        
-        try await send(.authenticateUser(user))
-            .status(.containingChallenge, or: SMTPError.loginFailure)
-        
-        try await self.send(.authenticatePassword(password))
-            .status(.authSucceeded, or: SMTPError.loginFailure)
-    }
-    
-    public func sendMail(_ mail: Mail) async throws {
-        var recipients = [MailUser]()
-        
-        for user in mail.to {
-            recipients.append(user)
-        }
-        
-        for user in mail.cc {
-            recipients.append(user)
-        }
-        
-        for user in mail.bcc {
-            recipients.append(user)
-        }
-        
-        try await send(.startMail(mail))
-            .status(.commandOK)
-        
-        for address in recipients {
-            try await send(.mailRecipient(address.email))
-                .status(.commandOK, .willForward)
-        }
-            
-        try await send(.startMailData)
-            .status(.startMailInput)
-        
-        try await send(.mailData(mail))
-            .status(.commandOK)
-    }
-}
-
-extension SMTPServerMessage {
-    func status(_ status: SMTPResponseCode..., or error: Error? = nil) throws {
-        let error = error ?? SMTPError.sendMailFailed(code)
-        
-        guard let currentStatus = responseCode else {
-            throw error
-        }
-        
-        for neededStatus in status {
-            if currentStatus == neededStatus {
-                return
-            }
-        }
-        
-        throw error
+    deinit {
+        close()
     }
 }
