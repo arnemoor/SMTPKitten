@@ -280,9 +280,11 @@ public final class SMTPClient {
     public func send(
         _ message: SMTPClientMessage
     ) async throws -> SMTPServerMessage {
-        return try await context.sendMessage {
+        let response = try await self.context.sendMessage {
             return self.channel.writeAndFlush(message)
         }.get()
+        
+        return response
     }
     
     /// Send a message without waiting for a response. This is useful for sending the `QUIT` command.
@@ -292,37 +294,27 @@ public final class SMTPClient {
         return self.channel.writeAndFlush(message)
     }
     
-    internal func doHandshake() -> EventLoopFuture<Void> {
-        return send(.ehlo(hostname: hostname)).flatMap { [weak self] message -> EventLoopFuture<Void> in
-            guard let self = self, let handshake = SMTPHandshake(message) else {
-                return self?.eventLoop.makeFailedFuture(SMTPError.missingHandshake) ?? self!.eventLoop.makeFailedFuture(SMTPError.missingHandshake)
+    internal func doHandshake() async throws {
+        let message = try await send(.ehlo(hostname: hostname))
+        guard let handshake = SMTPHandshake(message) else {
+            throw SMTPError.missingHandshake
+        }
+        
+        self.handshake = handshake
+        
+        if case .startTLS = self.ssl {
+            guard handshake.starttls else {
+                throw SMTPError.starttlsUnsupportedByServer
+            }
+            
+            try await starttls(configuration: self.sslConfiguration)
+            
+            let message = try await send(.ehlo(hostname: self.hostname))
+            guard let handshake = SMTPHandshake(message) else {
+                throw SMTPError.missingHandshake
             }
             
             self.handshake = handshake
-            
-            if case .startTLS = self.ssl {
-                guard handshake.starttls else {
-                    return self.eventLoop.makeFailedFuture(SMTPError.starttlsUnsupportedByServer)
-                }
-                
-                return self.starttls(configuration: self.sslConfiguration).flatMap { [weak self] in
-                    guard let self = self else {
-                        return self?.eventLoop.makeFailedFuture(SMTPError.unknown) ?? self!.eventLoop.makeFailedFuture(SMTPError.unknown)
-                    }
-                    
-                    return self.send(.ehlo(hostname: self.hostname)).flatMap { message -> EventLoopFuture<Void> in
-                        guard let handshake = SMTPHandshake(message) else {
-                            return self.eventLoop.makeFailedFuture(SMTPError.missingHandshake)
-                        }
-                        
-                        self.handshake = handshake
-                        
-                        return self.eventLoop.makeSucceededFuture(())
-                    }
-                }
-            } else {
-                return self.eventLoop.makeSucceededFuture(())
-            }
         }
     }
     
@@ -333,7 +325,7 @@ public final class SMTPClient {
         let sslContext = try NIOSSLContext(configuration: configuration.makeTlsConfiguration())
         let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: self.hostname)
         
-        try await self.channel.pipeline.addHandler(sslHandler, position: .first)
+        try await self.channel.pipeline.addHandler(sslHandler, position: .first).get()
     }
     
     public func login(user: String, password: String) async throws {
