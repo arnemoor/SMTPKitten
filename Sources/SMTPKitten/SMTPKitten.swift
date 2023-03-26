@@ -294,28 +294,13 @@ public final class SMTPClient {
         return self.channel.writeAndFlush(message)
     }
     
-    internal func doHandshake() async throws {
+    internal func doHandshake() async throws -> SMTPHandshake {
         let message = try await send(.ehlo(hostname: hostname))
         guard let handshake = SMTPHandshake(message) else {
             throw SMTPError.missingHandshake
         }
         
-        self.handshake = handshake
-        
-        if case .startTLS = self.ssl {
-            guard handshake.starttls else {
-                throw SMTPError.starttlsUnsupportedByServer
-            }
-            
-            try await starttls(configuration: self.sslConfiguration)
-            
-            let message = try await send(.ehlo(hostname: self.hostname))
-            guard let handshake = SMTPHandshake(message) else {
-                throw SMTPError.missingHandshake
-            }
-            
-            self.handshake = handshake
-        }
+        return handshake
     }
     
     internal func starttls(configuration: SMTPSSLConfiguration) async throws {
