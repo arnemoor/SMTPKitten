@@ -292,18 +292,38 @@ public final class SMTPClient {
         return self.channel.writeAndFlush(message)
     }
     
-    internal func doHandshake() async throws -> SMTPHandshake {
-        var message = try await send(.ehlo(hostname: hostname))
-        if let handshake = SMTPHandshake(message) {
-            return handshake
-        }
+    internal func doHandshake() -> EventLoopFuture<Void> {
+        return send(.ehlo(hostname: hostname)).flatMap { [weak self] message -> EventLoopFuture<Void> in
+            guard let self = self, let handshake = SMTPHandshake(message) else {
+                return self?.eventLoop.makeFailedFuture(SMTPError.missingHandshake) ?? self!.eventLoop.makeFailedFuture(SMTPError.missingHandshake)
+            }
             
-        message = try await self.send(.helo(hostname: self.hostname))
-        guard let handshake = SMTPHandshake(message) else {
-            throw SMTPError.missingHandshake
-        }
+            self.handshake = handshake
+            
+            if case .startTLS = self.ssl {
+                guard handshake.starttls else {
+                    return self.eventLoop.makeFailedFuture(SMTPError.starttlsUnsupportedByServer)
+                }
                 
-        return handshake
+                return self.starttls(configuration: self.sslConfiguration).flatMap { [weak self] in
+                    guard let self = self else {
+                        return self?.eventLoop.makeFailedFuture(SMTPError.unknown) ?? self!.eventLoop.makeFailedFuture(SMTPError.unknown)
+                    }
+                    
+                    return self.send(.ehlo(hostname: self.hostname)).flatMap { message -> EventLoopFuture<Void> in
+                        guard let handshake = SMTPHandshake(message) else {
+                            return self.eventLoop.makeFailedFuture(SMTPError.missingHandshake)
+                        }
+                        
+                        self.handshake = handshake
+                        
+                        return self.eventLoop.makeSucceededFuture(())
+                    }
+                }
+            } else {
+                return self.eventLoop.makeSucceededFuture(())
+            }
+        }
     }
     
     internal func starttls(configuration: SMTPSSLConfiguration) async throws {
